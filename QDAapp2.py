@@ -19,7 +19,7 @@ import itertools
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
+import plotly.graph_objects as go 
 import streamlit as st
 from sklearn.decomposition import PCA
 from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis
@@ -29,12 +29,11 @@ from sklearn.preprocessing import StandardScaler
 
 # Fixed colors for the known glass classes; anything else falls back to the pool below.
 FIXED_CLASS_COLORS = {
-    "Flatglas": "green",
-    "Telefoonglas": "red",
-    "Verpakkingsglas": "blue",
+    "PED glass": "green",
+    "Packaging glass": "red",
+    "Floatglass": "blue",
 }
-FALLBACK_COLOR_POOL = ["purple", "orange", "brown", "magenta", "gray", "teal", "gold",
-                        "blue", "green", "red"]
+FALLBACK_COLOR_POOL = ["purple", "orange", "brown", "magenta", "gray", "teal", "gold"]
 
 st.set_page_config(page_title="QDA Classifier", layout="wide")
 st.title("QDA Classifier")
@@ -130,13 +129,77 @@ def plot_class_regions(pca, viz_qda, X_pca, y, unknown_pca=None, unknown_labels=
                 name="Selected sample", hoverinfo="skip", showlegend=False,
             ))
     fig.update_layout(
-        title="How the classes are divided (2D PCA projection)",
+        title="QDA projection (shaded decision regions)",
         xaxis_title=f"PC1 ({pca.explained_variance_ratio_[0]:.1%} of variance)",
         yaxis_title=f"PC2 ({pca.explained_variance_ratio_[1]:.1%} of variance)",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
         height=550, margin=dict(t=80),
     )
     return fig
+
+
+def qda_pairwise_boundary_coeffs(qda, class_i, class_j):
+    """Coefficients (a, b, c, d, e, f) of the quadratic boundary curve
+
+        a*x1^2 + b*x1*x2 + c*x2^2 + d*x1 + e*x2 + f = 0
+
+    between two classes of a 2-D QuadraticDiscriminantAnalysis fitted with
+    store_covariance=True. This is the curve where the two classes'
+    discriminant functions are equal, i.e. delta_i(x) = delta_j(x), which is
+    exactly the boundary drawn between two shaded regions in the projection
+    plot.
+    """
+    classes = list(qda.classes_)
+    i, j = classes.index(class_i), classes.index(class_j)
+    mu_i, mu_j = np.asarray(qda.means_[i]), np.asarray(qda.means_[j])
+    Sigma_i, Sigma_j = np.asarray(qda.covariance_[i]), np.asarray(qda.covariance_[j])
+    pi_i, pi_j = qda.priors_[i], qda.priors_[j]
+
+    Mi = np.linalg.inv(Sigma_i)
+    Mj = np.linalg.inv(Sigma_j)
+    dM = Mi - Mj  # symmetric 2x2
+
+    a = -0.5 * dM[0, 0]
+    c = -0.5 * dM[1, 1]
+    b = -dM[0, 1]  # dM is symmetric, so this covers the cross term
+
+    lin = mu_i @ Mi - mu_j @ Mj
+    d, e = lin[0], lin[1]
+
+    f = (
+        -0.5 * (mu_i @ Mi @ mu_i - mu_j @ Mj @ mu_j)
+        - 0.5 * (np.log(np.linalg.det(Sigma_i)) - np.log(np.linalg.det(Sigma_j)))
+        + np.log(pi_i / pi_j)
+    )
+    return a, b, c, d, e, f
+
+
+def format_quadratic_latex(a, b, c, d, e, f, x1="x_1", x2="x_2"):
+    """Render a*x1^2 + b*x1*x2 + c*x2^2 + d*x1 + e*x2 + f = 0 as a LaTeX string."""
+    def term(coef, suffix):
+        if abs(coef) < 1e-10:
+            return None
+        return f"{coef:.4f}{suffix}"
+
+    parts = [
+        term(a, f"{x1}^2"),
+        term(b, f"{x1}{x2}"),
+        term(c, f"{x2}^2"),
+        term(d, f"{x1}"),
+        term(e, f"{x2}"),
+        term(f, ""),
+    ]
+    parts = [p for p in parts if p is not None]
+    if not parts:
+        return "0 = 0"
+
+    expr = parts[0]
+    for p in parts[1:]:
+        if p.startswith("-"):
+            expr += f" - {p[1:]}"
+        else:
+            expr += f" + {p}"
+    return expr + " = 0"
 
 
 # =================================================================
@@ -273,16 +336,14 @@ if db_file is not None:
             # Example class-region plot, analogous to the example
             # tree visualization in the Random Forest app
             # ---------------------------------------------------
-            st.subheader("How the classes are divided (example visualization)")
-            st.caption(
-                "The real model uses all features at once, which can't be drawn directly. "
-                "This plot compresses the data to its 2 strongest principal components "
-                "and shows the region each class would occupy — an approximation of the "
-                "true decision boundary, useful for building intuition."
-            )
+            st.subheader("QDA projection")
             pca = PCA(n_components=2, random_state=random_state).fit(Xs)
             X_pca = pca.transform(Xs)
-            viz_qda = QuadraticDiscriminantAnalysis(reg_param=reg_param).fit(X_pca, y)
+            # store_covariance=True so we can pull each class's fitted covariance
+            # matrix back out afterwards to build the boundary formulas below.
+            viz_qda = QuadraticDiscriminantAnalysis(
+                reg_param=reg_param, store_covariance=True
+            ).fit(X_pca, y)
 
             st.session_state.pca = pca
             st.session_state.viz_qda = viz_qda
@@ -290,7 +351,38 @@ if db_file is not None:
             st.session_state.X_ref = X
             st.session_state.y_ref = y
 
-            st.plotly_chart(plot_class_regions(pca, viz_qda, X_pca, y), use_container_width=True)
+            plot_tab, formula_tab = st.tabs(["Projection plot", "Decision boundary formulas"])
+
+            with plot_tab:
+                st.caption(
+                    "The real model uses all features at once, which can't be drawn directly. "
+                    "This plot compresses the data to its 2 strongest principal components "
+                    "and shows the region each class would occupy — an approximation of the "
+                    "true decision boundary, useful for building intuition."
+                )
+                st.plotly_chart(plot_class_regions(pca, viz_qda, X_pca, y), use_container_width=True)
+
+            with formula_tab:
+                st.caption(
+                    "For each pair of classes, QDA assigns a point to whichever class has the "
+                    "higher discriminant score. Both scores are quadratic functions of the "
+                    "coordinates, so the boundary you see between two shaded regions above is "
+                    r"the curve where the two scores are equal — solving $\delta_i(x)=\delta_j(x)$ "
+                    "gives a quadratic equation in "
+                    r"$x_1$ (PC1) and $x_2$ (PC2):"
+                )
+                st.latex(r"a\,x_1^2 + b\,x_1 x_2 + c\,x_2^2 + d\,x_1 + e\,x_2 + f = 0")
+                st.caption(
+                    "Below are the fitted coefficients for every pair of classes, in the same "
+                    "PC1/PC2 space as the plot above. Note these describe only the 2-component "
+                    "visualization — the actual classifier used in step 2 works in the full "
+                    f"{len(feature_cols)}-element space and can't be reduced to a single formula "
+                    "this simply."
+                )
+                for ci, cj in itertools.combinations(sorted(y.unique()), 2):
+                    a, b, c, d, e, f_coef = qda_pairwise_boundary_coeffs(viz_qda, ci, cj)
+                    st.markdown(f"**{ci} vs. {cj}**")
+                    st.latex(format_quadratic_latex(a, b, c, d, e, f_coef))
 
 
 # =================================================================
