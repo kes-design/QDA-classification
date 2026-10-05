@@ -30,8 +30,8 @@ from sklearn.preprocessing import StandardScaler
 # Fixed colors for the known glass classes; anything else falls back to the pool below.
 FIXED_CLASS_COLORS = {
     "PED glass": "green",
-    "Packaging glass": "red",
-    "Floatglass": "blue",
+    "Container glass": "red",
+    "Float glass": "blue",
 }
 FALLBACK_COLOR_POOL = ["purple", "orange", "brown", "magenta", "gray", "teal", "gold"]
 
