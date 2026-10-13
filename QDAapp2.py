@@ -21,6 +21,9 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 from sklearn.decomposition import PCA
 from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
@@ -204,6 +207,174 @@ def format_quadratic_latex(a, b, c, d, e, f, x1="x_1", x2="x_2"):
     return expr + " = 0"
 
 
+# ---------------------------------------------------------------
+# Excel export
+# ---------------------------------------------------------------
+def _py(v):
+    """Convert numpy scalars / NaN to plain Python values openpyxl can write."""
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return v.item() if hasattr(v, "item") else v
+
+
+def _write_header(ws, row, headers):
+    for j, h in enumerate(headers, start=1):
+        cell = ws.cell(row=row, column=j, value=h)
+        cell.font = Font(name="Calibri", size=11, bold=True)
+        cell.alignment = Alignment(horizontal="center")
+
+
+def _set_widths(ws, headers, first_col_width=None):
+    for j, h in enumerate(headers, start=1):
+        ws.column_dimensions[get_column_letter(j)].width = max(11, len(str(h)) + 3)
+    if first_col_width:
+        ws.column_dimensions["A"].width = first_col_width
+
+
+def qda_class_score_terms(model, scaler):
+    """Per-class pieces of the full quadratic score, expressed in the measurement
+    space the user supplies (log10 concentrations if the log transform is on),
+    so no standardization step is needed:
+
+        score_k(x) = -0.5 (x - mean_k)^T Precision_k (x - mean_k) + Constant_k
+
+    Constant_k = -0.5 ln|Sigma_k| + ln(prior_k). The posterior probabilities are
+    the softmax of these scores.
+    """
+    D = np.asarray(scaler.scale_)
+    out = {}
+    for k, cls in enumerate(model.classes_):
+        S = np.asarray(model.covariance_[k])          # covariance in standardized space
+        mean_x = np.asarray(scaler.mean_) + D * np.asarray(model.means_[k])
+        precision_x = np.linalg.inv(S) / np.outer(D, D)
+        logdet_x = np.linalg.slogdet(S)[1] + 2.0 * np.sum(np.log(D))
+        const = -0.5 * logdet_x + np.log(model.priors_[k])
+        out[cls] = (const, mean_x, precision_x)
+    return out
+
+
+def pc_axis_coeffs(pca, scaler):
+    """Intercept and per-feature coefficients so that PC_k = intercept_k + sum(coef * feature)."""
+    scale = np.asarray(scaler.scale_)
+    mean = np.asarray(scaler.mean_)
+    comp = np.asarray(pca.components_)
+    coefs = comp / scale
+    intercepts = -(comp @ (mean / scale + np.asarray(pca.mean_)))
+    return intercepts, coefs
+
+
+def build_excel(results, unk_pca, model, scaler, pca, viz_qda, feature_cols,
+                log_transform, prob_threshold):
+    """Return the classification results as .xlsx bytes (same layout as the LDA export):
+    Predictions + the formula tabs describing the fitted model."""
+    wb = Workbook()
+    space = "log10 of the concentration" if log_transform else "the raw concentration"
+    classes = list(model.classes_)
+
+    # ---- Predictions ----------------------------------------------------------
+    ws = wb.active
+    ws.title = "Predictions"
+    df = results.copy()
+    df["PC1"] = unk_pca[:, 0]
+    df["PC2"] = unk_pca[:, 1]
+    headers = [str(c) for c in df.columns]
+
+    ws["A1"] = (
+        "Each row is an unknown sample with its predicted class, posterior probability, "
+        f"confidence flag (threshold = {prob_threshold:.0%}), per-class probabilities, "
+        "and its position on the PC1/PC2 projection plot."
+    )
+    ws["A2"] = (
+        "PC1 and PC2 are computed as axis = Intercept + sum(coefficient x feature value) — see the "
+        "'PC1_PC2 formula' tab. The class itself is decided in the full feature space by the "
+        "quadratic scores on the 'Classification formula' tab. Feature value = " + space + "."
+    )
+    _write_header(ws, 4, headers)
+    conf_col = headers.index("confident") if "confident" in headers else None
+    amber = PatternFill("solid", start_color="FFF3CD", end_color="FFF3CD")
+    for i, row in enumerate(df.itertuples(index=False), start=5):
+        for j, v in enumerate(row, start=1):
+            ws.cell(row=i, column=j, value=_py(v))
+        if conf_col is not None and not bool(row[conf_col]):
+            for j in range(1, len(headers) + 1):
+                ws.cell(row=i, column=j).fill = amber
+    _set_widths(ws, headers)
+    ws.column_dimensions["A"].width = max(14, int(df.iloc[:, 0].astype(str).str.len().max() or 0) + 3)
+
+    # ---- Classification formula ----------------------------------------------
+    ws = wb.create_sheet("Classification formula")
+    ws["A1"] = ("QDA assigns each class a quadratic discriminant score. A new sample is classified "
+                "into the class with the highest score:")
+    ws["A2"] = ("score(class) = Constant - 0.5 x (x - Mean)ᵀ x Precision x (x - Mean),   "
+                "where x = vector of feature values (" + space + ")")
+    ws["A3"] = ("Constant = -0.5 x ln|Covariance| + ln(prior). Precision = inverse covariance matrix "
+                "(one block per class below). Posterior probabilities = softmax of the scores.")
+    ws["A4"] = "Class means (one row per class) are listed in the feature columns of the first table."
+    terms = qda_class_score_terms(model, scaler)
+    head = ["Class", "Constant"] + list(feature_cols)
+    _write_header(ws, 6, head)
+    for i, cls in enumerate(classes, start=7):
+        const, mean_x, _ = terms[cls]
+        c = ws.cell(row=i, column=1, value=cls)
+        c.font = Font(name="Calibri", size=11, bold=True)
+        ws.cell(row=i, column=2, value=float(const))
+        for j, m in enumerate(mean_x, start=3):
+            ws.cell(row=i, column=j, value=float(m))
+    r = 7 + len(classes) + 1
+    for cls in classes:
+        _, _, P = terms[cls]
+        t = ws.cell(row=r, column=1, value=f"{cls} - Precision matrix (inverse covariance)")
+        t.font = Font(name="Calibri", size=11, bold=True)
+        _write_header(ws, r + 1, [""] + list(feature_cols))
+        for a, feat in enumerate(feature_cols):
+            c = ws.cell(row=r + 2 + a, column=1, value=feat)
+            c.font = Font(name="Calibri", size=11, bold=True)
+            for b in range(len(feature_cols)):
+                ws.cell(row=r + 2 + a, column=2 + b, value=float(P[a, b]))
+        r += len(feature_cols) + 4
+    _set_widths(ws, head, first_col_width=34)
+
+    # ---- Pairwise boundaries --------------------------------------------------
+    ws = wb.create_sheet("Pairwise boundaries")
+    ws["A1"] = "The boundary between two classes is where their scores are tied. In the PC1/PC2 projection plot it is the curve:"
+    ws["A2"] = "a x PC1² + b x PC1·PC2 + c x PC2² + d x PC1 + e x PC2 + f = 0"
+    ws["A3"] = ("Positive favors the first-named class in the 'Boundary' column, negative favors the second. "
+                "These describe the 2-component visualization only, not the full-space classifier.")
+    head = ["Boundary", "a (PC1²)", "b (PC1·PC2)", "c (PC2²)", "d (PC1)", "e (PC2)", "f (constant)"]
+    _write_header(ws, 5, head)
+    for i, (ci, cj) in enumerate(itertools.combinations(sorted(classes), 2), start=6):
+        c = ws.cell(row=i, column=1, value=f"{ci} vs {cj}")
+        c.font = Font(name="Calibri", size=11, bold=True)
+        for j, v in enumerate(qda_pairwise_boundary_coeffs(viz_qda, ci, cj), start=2):
+            ws.cell(row=i, column=j, value=float(v))
+    _set_widths(ws, head, first_col_width=34)
+
+    # ---- PC1_PC2 formula ------------------------------------------------------
+    ws = wb.create_sheet("PC1_PC2 formula")
+    ws["A1"] = ("This is the formula behind the projection axes used in the app's plots: each axis is a "
+                "linear combination of your feature values (" + space + ").")
+    ws["A2"] = "axis = Intercept + sum(coefficient x feature value)"
+    head = ["Component", "Intercept"] + list(feature_cols)
+    _write_header(ws, 4, head)
+    intercepts, coefs = pc_axis_coeffs(pca, scaler)
+    for k in range(2):
+        c = ws.cell(row=5 + k, column=1, value=f"PC{k + 1}")
+        c.font = Font(name="Calibri", size=11, bold=True)
+        ws.cell(row=5 + k, column=2, value=float(intercepts[k]))
+        for j, v in enumerate(coefs[k], start=3):
+            ws.cell(row=5 + k, column=j, value=float(v))
+    _set_widths(ws, head, first_col_width=34)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 # =================================================================
 # STEP 1 — Upload database & train
 # =================================================================
@@ -332,7 +503,9 @@ if db_file is not None:
             # Final model trained on ALL data (used for real classification)
             scaler = StandardScaler().fit(X)
             Xs = scaler.transform(X)
-            final_qda = QuadraticDiscriminantAnalysis(reg_param=REG_PARAM)
+            # store_covariance=True so the Excel export can include the exact class
+            # covariance matrices (and thus the full quadratic scoring formula).
+            final_qda = QuadraticDiscriminantAnalysis(reg_param=REG_PARAM, store_covariance=True)
             final_qda.fit(Xs, y)
 
             st.session_state.model = final_qda
@@ -514,15 +687,25 @@ else:
                     use_container_width=True,
                 )
 
-                buffer = io.BytesIO()
-                results.to_csv(buffer, index=False)
-                buffer.seek(0)
-                st.download_button(
-                    "Download results as CSV",
-                    data=buffer,
-                    file_name="classification_results.csv",
-                    mime="text/csv",
-                )
+                dl_xlsx, dl_csv = st.columns(2)
+                with dl_xlsx:
+                    st.download_button(
+                        "Download results as Excel",
+                        data=build_excel(
+                            results, unk_pca, model, scaler, st.session_state.pca,
+                            st.session_state.viz_qda, feature_cols, log_transform, prob_threshold,
+                        ),
+                        file_name="classification_results.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary",
+                    )
+                with dl_csv:
+                    st.download_button(
+                        "Download results as CSV",
+                        data=results.to_csv(index=False).encode("utf-8"),
+                        file_name="classification_results.csv",
+                        mime="text/csv",
+                    )
 
     with tab_manual:
         st.caption("Enter concentrations for a single sample (same units as the reference database).")
