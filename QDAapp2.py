@@ -19,12 +19,12 @@ import itertools
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go 
+import plotly.graph_objects as go
 import streamlit as st
 from sklearn.decomposition import PCA
 from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 # Fixed colors for the known glass classes; anything else falls back to the pool below.
@@ -34,6 +34,9 @@ FIXED_CLASS_COLORS = {
     "Float glass": "blue",
 }
 FALLBACK_COLOR_POOL = ["purple", "orange", "brown", "magenta", "gray", "teal", "gold"]
+
+# Fixed model setting (no longer a slider).
+REG_PARAM = 0.0  # 0 = full QDA; raise toward 1 if classes are small vs. number of elements
 
 st.set_page_config(page_title="QDA Classifier", layout="wide")
 st.title("QDA Classifier")
@@ -56,7 +59,6 @@ if "model" not in st.session_state:
     st.session_state.feature_cols = None
     st.session_state.class_labels = None
     st.session_state.log_transform = None
-    st.session_state.prob_threshold = None
     st.session_state.random_state = None
     st.session_state.pca = None
     st.session_state.viz_qda = None
@@ -238,19 +240,14 @@ if db_file is not None:
             help="Recommended: trace-element concentrations are typically right-skewed; "
                  "QDA assumes each class is multivariate normal.",
         )
-        reg_param = st.slider(
-            "Regularization (reg_param)", 0.0, 1.0, 0.0, 0.01,
-            help="0 = full QDA (separate covariance per class). Increase toward 1 if a "
-                 "class has few samples relative to the number of elements.",
-        )
-        cv_folds = st.slider("Cross-validation folds", 2, 10, 10, 1)
-        prob_threshold = st.slider(
-            "Confidence threshold", 0.5, 1.0, 0.90, 0.01,
-            help="Posterior probability below which a prediction is flagged as not confident.",
+        test_size = st.slider(
+            "Test size", 0.1, 0.5, 0.2, 0.05,
+            help="Fraction of the database held out to evaluate the model. "
+                 "The model is trained on the rest, then scored on the held-out samples.",
         )
         random_state = st.number_input(
             "Random state", min_value=0, max_value=10_000, value=42, step=1,
-            help="Seed used for the cross-validation shuffling and the PCA visualization. "
+            help="Seed used for the train/test split and the PCA visualization. "
                  "Change it to check how sensitive the results are, or keep it fixed for reproducibility.",
         )
 
@@ -293,30 +290,49 @@ if db_file is not None:
             st.write("Class counts:")
             st.dataframe(y.value_counts().rename("samples"))
 
-            scaler = StandardScaler().fit(X)
-            Xs = scaler.transform(X)
-
-            min_class_size = y.value_counts().min()
-            folds = min(cv_folds, min_class_size)
-            skf = StratifiedKFold(n_splits=folds, shuffle=True, random_state=random_state)
-            qda_cv = QuadraticDiscriminantAnalysis(reg_param=reg_param)
-            y_pred_cv = cross_val_predict(qda_cv, Xs, y, cv=skf)
-
             labels = sorted(y.unique())
+
+            # Each class needs at least 2 samples for a stratified split
+            if y.value_counts().min() < 2:
+                st.error("Every class needs at least 2 samples for a train/test split.")
+                st.stop()
+
+            n_test = int(np.ceil(test_size * len(y)))
+            if n_test < len(labels):
+                st.error("Test set is smaller than the number of classes. Increase the test size.")
+                st.stop()
+
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=test_size, stratify=y, random_state=random_state
+            )
+
+            # Evaluation model: scaler and QDA fitted on the training portion only,
+            # so the test score isn't inflated by information from the test samples.
+            eval_scaler = StandardScaler().fit(X_train)
+            eval_qda = QuadraticDiscriminantAnalysis(reg_param=REG_PARAM)
+            eval_qda.fit(eval_scaler.transform(X_train), y_train)
+            y_pred_test = eval_qda.predict(eval_scaler.transform(X_test))
 
             col1, col2 = st.columns(2)
             with col1:
-                st.metric("Cross-validated accuracy", f"{accuracy_score(y, y_pred_cv):.1%}")
-                st.caption(f"Stratified {folds}-fold cross-validation.")
+                st.metric("Test-set accuracy", f"{accuracy_score(y_test, y_pred_test):.1%}")
+                st.caption(
+                    f"Trained on {len(y_train)} samples, tested on {len(y_test)} "
+                    f"({test_size:.0%} held out, stratified)."
+                )
                 st.text("Classification report:")
-                st.text(classification_report(y, y_pred_cv, target_names=labels))
+                st.text(classification_report(
+                    y_test, y_pred_test, labels=labels, target_names=labels, zero_division=0
+                ))
             with col2:
-                cm = confusion_matrix(y, y_pred_cv, labels=labels)
+                cm = confusion_matrix(y_test, y_pred_test, labels=labels)
                 st.text("Confusion matrix (rows = true, columns = predicted):")
                 st.dataframe(pd.DataFrame(cm, index=labels, columns=labels))
 
             # Final model trained on ALL data (used for real classification)
-            final_qda = QuadraticDiscriminantAnalysis(reg_param=reg_param)
+            scaler = StandardScaler().fit(X)
+            Xs = scaler.transform(X)
+            final_qda = QuadraticDiscriminantAnalysis(reg_param=REG_PARAM)
             final_qda.fit(Xs, y)
 
             st.session_state.model = final_qda
@@ -324,7 +340,6 @@ if db_file is not None:
             st.session_state.feature_cols = feature_cols
             st.session_state.class_labels = labels
             st.session_state.log_transform = log_transform
-            st.session_state.prob_threshold = prob_threshold
             st.session_state.random_state = random_state
 
             st.success(
@@ -333,8 +348,7 @@ if db_file is not None:
             )
 
             # ---------------------------------------------------
-            # Example class-region plot, analogous to the example
-            # tree visualization in the Random Forest app
+            # Example class-region plot
             # ---------------------------------------------------
             st.subheader("QDA projection")
             pca = PCA(n_components=2, random_state=random_state).fit(Xs)
@@ -342,7 +356,7 @@ if db_file is not None:
             # store_covariance=True so we can pull each class's fitted covariance
             # matrix back out afterwards to build the boundary formulas below.
             viz_qda = QuadraticDiscriminantAnalysis(
-                reg_param=reg_param, store_covariance=True
+                reg_param=REG_PARAM, store_covariance=True
             ).fit(X_pca, y)
 
             st.session_state.pca = pca
@@ -393,12 +407,17 @@ st.header("2. Classify unknown samples")
 if st.session_state.model is None:
     st.info("Train a model in step 1 first.")
 else:
-    tab_upload, tab_manual = st.tabs(["Upload a file", "Enter one sample manually"])
     feature_cols = st.session_state.feature_cols
     scaler = st.session_state.scaler
     model = st.session_state.model
     log_transform = st.session_state.log_transform
-    prob_threshold = st.session_state.prob_threshold
+
+    prob_threshold = st.slider(
+        "Confidence threshold", 0.5, 1.0, 0.90, 0.01,
+        help="Posterior probability below which a prediction is flagged as not confident.",
+    )
+
+    tab_upload, tab_manual = st.tabs(["Upload a file", "Enter one sample manually"])
 
     def _classify(unknown_df):
         missing_cols = [c for c in feature_cols if c not in unknown_df.columns]
