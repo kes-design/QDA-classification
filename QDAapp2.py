@@ -46,8 +46,8 @@ st.title("QDA Classifier")
 
 st.markdown(
     """
-Upload a **database file** where each sheet is a class (e.g. `Flatglas`,
-`Verpakkingsglas`, `Telefoonglas`) and rows are samples with element
+Upload a **database file** where each sheet is a class (e.g. `Float glass`,
+`Container glass`, `PED glass`) and rows are samples with element
 concentrations as columns. Then upload an **unknown samples file** with
 the same element columns to classify.
 """
